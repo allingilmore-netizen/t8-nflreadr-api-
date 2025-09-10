@@ -1,4 +1,4 @@
-# api.R — plumber endpoints backed by nflreadr (robust matching + schema-robust)
+# api.R — Plumber endpoints backed by nflreadr (schema-robust + name matching)
 library(plumber)
 library(nflreadr)
 library(dplyr)
@@ -6,75 +6,105 @@ library(stringr)
 
 # -------- Helpers --------
 
-# Normalize naming differences across nflreadr versions
+# Load weekly player stats for given seasons and normalize column names across versions
 get_weekly <- function(seasons) {
-  df <- nflreadr::load_player_stats(seasons = seasons)
+  # offense = passing/rushing/receiving; keeps payload smaller than "all"
+  df <- nflreadr::load_player_stats(seasons = seasons, stat_type = "offense")
   nm <- names(df)
+
+  # normalize player name column
+  if (!"player_name" %in% nm && "player_display_name" %in% nm) {
+    df <- dplyr::rename(df, player_name = player_display_name)
+  }
+
+  # normalize team/opponent columns
   if (!"team" %in% nm && "recent_team" %in% nm) {
     df <- dplyr::rename(df, team = recent_team)
   }
   if (!"opponent_team" %in% nm && "opponent" %in% nm) {
     df <- dplyr::rename(df, opponent_team = opponent)
   }
-  df %>%
-    select(any_of(c("season","week","player_id","player_name",
-                    "team","opponent_team","passing_tds")))
+
+  # make sure passing_tds exists (it should for offense stats)
+  if (!"passing_tds" %in% names(df)) {
+    stop("Column 'passing_tds' not found in nflreadr::load_player_stats output.")
+  }
+
+  dplyr::select(
+    df,
+    dplyr::any_of(c("season","week","player_id","player_name",
+                    "team","opponent_team","passing_tds"))
+  )
 }
 
-# Normalize player names (lowercase, strip suffixes/punct, squish spaces)
+# Normalize names: lowercase, strip punctuation, drop common suffixes, squish spaces
 norm_name <- function(x) {
-  x %>%
-    str_to_lower() %>%
-    str_replace_all("[^a-z0-9 ]", " ") %>%        # remove punctuation
-    str_replace_all("\\b(ii|iii|iv|jr|sr)\\b", "") %>% # drop common suffixes
-    str_squish()
+  x |>
+    stringr::str_to_lower() |>
+    stringr::str_replace_all("[^a-z0-9 ]", " ") |>
+    stringr::str_replace_all("\\b(ii|iii|iv|jr|sr)\\b", "") |>
+    stringr::str_squish()
 }
 
-# Find rows for a player using robust matching; fall back to starts-with
+# Find rows for a player using robust matching; falls back to starts-with / contains
 find_player_rows <- function(wk, player) {
+  # choose the name column (after normalization we expect player_name)
+  name_col <- if ("player_name" %in% names(wk)) "player_name"
+              else if ("player_display_name" %in% names(wk)) "player_display_name"
+              else stop("No player name column found.")
+  name_vec <- wk[[name_col]]
+
   p_norm <- norm_name(player)
-  wk <- wk %>% mutate(player_norm = norm_name(player_name))
-  exact <- wk %>% filter(player_norm == p_norm)
-  if (nrow(exact) > 0) return(exact %>% select(-player_norm))
+  wk <- wk |> dplyr::mutate(player_norm = norm_name(name_vec))
 
-  # fallback: begins-with (handles players with middle/extra tokens)
-  pref <- wk %>% filter(str_starts(player_norm, p_norm))
-  if (nrow(pref) > 0) return(pref %>% select(-player_norm))
+  exact <- wk |> dplyr::filter(player_norm == p_norm)
+  if (nrow(exact) > 0) return(dplyr::select(exact, -player_norm))
 
-  # fallback: contains (very loose)
-  cont <- wk %>% filter(str_detect(player_norm, fixed(p_norm)))
-  if (nrow(cont) > 0) return(cont %>% select(-player_norm))
+  pref <- wk |> dplyr::filter(stringr::str_starts(player_norm, p_norm))
+  if (nrow(pref) > 0) return(dplyr::select(pref, -player_norm))
 
-  # nothing found
+  cont <- wk |> dplyr::filter(stringr::str_detect(player_norm, stringr::fixed(p_norm)))
+  if (nrow(cont) > 0) return(dplyr::select(cont, -player_norm))
+
+  # nothing
   wk[0, setdiff(names(wk), "player_norm"), drop = FALSE]
 }
 
-# Top-5 suggestions (distinct names) to help the caller correct input
+# Up to 5 name suggestions to help callers correct input
 name_suggestions <- function(wk, player) {
+  name_col <- if ("player_name" %in% names(wk)) "player_name"
+              else if ("player_display_name" %in% names(wk)) "player_display_name"
+              else return(character())
   p_norm <- norm_name(player)
-  wk2 <- wk %>% mutate(player_norm = norm_name(player_name))
-  cand <- wk2 %>%
-    filter(
-      str_starts(player_norm, p_norm) | str_detect(player_norm, fixed(p_norm))
-    ) %>%
-    distinct(player_name) %>%
-    arrange(player_name) %>%
-    head(5) %>%
-    pull(player_name)
-  unname(cand)
+  wk2 <- wk |> dplyr::mutate(player_norm = norm_name(.data[[name_col]]))
+  cand <- wk2 |>
+    dplyr::filter(
+      stringr::str_starts(player_norm, p_norm) |
+      stringr::str_detect(player_norm, stringr::fixed(p_norm))
+    ) |>
+    dplyr::distinct(.data[[name_col]]) |>
+    dplyr::arrange(.data[[name_col]]) |>
+    head(5)
+
+  # pull() with tidyselect fails on computed names; use [[ ]] safely
+  if (nrow(cand) == 0) character()
+  else unname(cand[[1]])
 }
 
-# ------------- Endpoints ----------------
+# -------- Endpoints --------
 
 #* Health
 #* @get /healthz
 function() {
-  list(ok = TRUE, nflreadr = as.character(utils::packageVersion("nflreadr")))
+  list(
+    ok = TRUE,
+    nflreadr = as.character(utils::packageVersion("nflreadr"))
+  )
 }
 
-#* Return weekly rows for a player (case-insensitive, robust)
+#* Weekly rows for a player (robust name match)
 #* @param player
-#* @param seasons
+#* @param seasons Comma-separated years, e.g. 2025,2024
 #* @get /qb_weekly
 function(player = "", seasons = "") {
   tryCatch({
@@ -83,8 +113,8 @@ function(player = "", seasons = "") {
     }
     yrs <- as.integer(strsplit(seasons, ",", fixed = TRUE)[[1]])
     wk <- get_weekly(yrs)
-    qb <- find_player_rows(wk, player) %>% arrange(season, week)
 
+    qb <- find_player_rows(wk, player) |> dplyr::arrange(season, week)
     if (nrow(qb) == 0) {
       return(list(
         error = paste("no rows for", player),
@@ -97,11 +127,11 @@ function(player = "", seasons = "") {
   })
 }
 
-#* Return lambda estimate for QB passing TDs with optional opponent adjust
+#* Lambda estimate for QB passing TDs (optional opponent adjust)
 #* @param player
 #* @param seasons Example: 2025,2024
-#* @param window:integer Default 16
-#* @param opponent Optional team abbr to adjust vs league avg allowed (e.g., BAL)
+#* @param window:integer Rolling games window (default 16)
+#* @param opponent Optional defense abbr to adjust vs league avg allowed (e.g., BAL)
 #* @get /qb_lambda
 function(player = "", seasons = "", window = 16, opponent = "") {
   tryCatch({
@@ -112,7 +142,7 @@ function(player = "", seasons = "", window = 16, opponent = "") {
     yrs <- as.integer(strsplit(seasons, ",", fixed = TRUE)[[1]])
     wk <- get_weekly(yrs)
 
-    qb <- find_player_rows(wk, player) %>% arrange(season, week)
+    qb <- find_player_rows(wk, player) |> dplyr::arrange(season, week)
     if (nrow(qb) == 0) {
       return(list(
         error = paste("no rows for", player),
@@ -120,24 +150,28 @@ function(player = "", seasons = "", window = 16, opponent = "") {
       ))
     }
 
-    # base lambda = mean of last N games, NAs -> 0
-    vec <- qb %>% tail(window) %>% pull(passing_tds)
+    # base lambda = mean of last N games; treat NA as 0
+    vec <- qb |> dplyr::pull(passing_tds)
+    vec <- tail(vec, window)
     vec[is.na(vec)] <- 0
     base <- mean(vec)
 
-    # optional opponent adjustment (uses normalized opponent_team)
+    # optional opponent adjustment (needs opponent_team column in wk)
     if (opponent != "" && "opponent_team" %in% names(wk)) {
-      def_allow <- wk %>%
-        group_by(season, opponent_team) %>%
-        summarise(opp_allow_tdpg = mean(passing_tds, na.rm = TRUE), .groups = "drop") %>%
-        rename(defteam = opponent_team)
+      def_allow <- wk |>
+        dplyr::group_by(season, opponent_team) |>
+        dplyr::summarise(
+          opp_allow_tdpg = mean(passing_tds, na.rm = TRUE),
+          .groups = "drop"
+        ) |>
+        dplyr::rename(defteam = opponent_team)
 
       lg_avg <- mean(def_allow$opp_allow_tdpg, na.rm = TRUE)
-      row <- def_allow %>% filter(defteam == opponent)
+      row <- def_allow |> dplyr::filter(defteam == opponent)
 
       if (nrow(row) > 0 && is.finite(lg_avg) && lg_avg > 0) {
         factor <- as.numeric(row$opp_allow_tdpg[1]) / lg_avg
-        base <- base * max(0.6, min(1.4, factor))
+        base <- base * max(0.6, min(1.4, factor))  # clamp adjustment
       }
     }
 
