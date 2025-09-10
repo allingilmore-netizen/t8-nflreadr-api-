@@ -1,4 +1,4 @@
-# api.R — Plumber endpoints backed by nflreadr (schema-robust + name matching)
+# api.R — Plumber endpoints backed by nflreadr (schema-robust + prefers display name)
 library(plumber)
 library(nflreadr)
 library(dplyr)
@@ -8,16 +8,11 @@ library(stringr)
 
 # Load weekly player stats for given seasons and normalize column names across versions
 get_weekly <- function(seasons) {
-  # offense = passing/rushing/receiving; keeps payload smaller than "all"
+  # offense keeps payload tighter than "all"
   df <- nflreadr::load_player_stats(seasons = seasons, stat_type = "offense")
   nm <- names(df)
 
-  # normalize player name column
-  if (!"player_name" %in% nm && "player_display_name" %in% nm) {
-    df <- dplyr::rename(df, player_name = player_display_name)
-  }
-
-  # normalize team/opponent columns
+  # Normalize team/opponent columns
   if (!"team" %in% nm && "recent_team" %in% nm) {
     df <- dplyr::rename(df, team = recent_team)
   }
@@ -25,16 +20,25 @@ get_weekly <- function(seasons) {
     df <- dplyr::rename(df, opponent_team = opponent)
   }
 
-  # make sure passing_tds exists (it should for offense stats)
+  # Build a unified 'name' column, preferring full display name when available
+  # Common possibilities across versions: player_display_name, player_name, player
+  name_col <- if ("player_display_name" %in% nm) "player_display_name"
+    else if ("player_name" %in% nm) "player_name"
+    else if ("player" %in% nm) "player"
+    else NA_character_
+
+  if (is.na(name_col)) stop("No player name column found in load_player_stats output.")
+
+  df <- df %>% mutate(name = .data[[name_col]])
+
+  # Ensure passing_tds exists (offense should have it)
   if (!"passing_tds" %in% names(df)) {
-    stop("Column 'passing_tds' not found in nflreadr::load_player_stats output.")
+    stop("Column 'passing_tds' not found in load_player_stats output.")
   }
 
-  dplyr::select(
-    df,
-    dplyr::any_of(c("season","week","player_id","player_name",
-                    "team","opponent_team","passing_tds"))
-  )
+  # Keep only what we need
+  df %>%
+    select(any_of(c("season","week","player_id","name","team","opponent_team","passing_tds")))
 }
 
 # Normalize names: lowercase, strip punctuation, drop common suffixes, squish spaces
@@ -46,49 +50,37 @@ norm_name <- function(x) {
     stringr::str_squish()
 }
 
-# Find rows for a player using robust matching; falls back to starts-with / contains
+# Find rows for a player using robust matching on unified 'name'
 find_player_rows <- function(wk, player) {
-  # choose the name column (after normalization we expect player_name)
-  name_col <- if ("player_name" %in% names(wk)) "player_name"
-              else if ("player_display_name" %in% names(wk)) "player_display_name"
-              else stop("No player name column found.")
-  name_vec <- wk[[name_col]]
-
+  if (!"name" %in% names(wk)) stop("Internal error: 'name' column missing after normalization.")
   p_norm <- norm_name(player)
-  wk <- wk |> dplyr::mutate(player_norm = norm_name(name_vec))
+  wk2 <- wk %>% mutate(name_norm = norm_name(name))
 
-  exact <- wk |> dplyr::filter(player_norm == p_norm)
-  if (nrow(exact) > 0) return(dplyr::select(exact, -player_norm))
+  exact <- wk2 %>% filter(name_norm == p_norm)
+  if (nrow(exact) > 0) return(exact %>% select(-name_norm))
 
-  pref <- wk |> dplyr::filter(stringr::str_starts(player_norm, p_norm))
-  if (nrow(pref) > 0) return(dplyr::select(pref, -player_norm))
+  pref <- wk2 %>% filter(str_starts(name_norm, p_norm))
+  if (nrow(pref) > 0) return(pref %>% select(-name_norm))
 
-  cont <- wk |> dplyr::filter(stringr::str_detect(player_norm, stringr::fixed(p_norm)))
-  if (nrow(cont) > 0) return(dplyr::select(cont, -player_norm))
+  cont <- wk2 %>% filter(str_detect(name_norm, fixed(p_norm)))
+  if (nrow(cont) > 0) return(cont %>% select(-name_norm))
 
   # nothing
-  wk[0, setdiff(names(wk), "player_norm"), drop = FALSE]
+  wk2[0, setdiff(names(wk2), "name_norm"), drop = FALSE]
 }
 
-# Up to 5 name suggestions to help callers correct input
+# Up to 5 suggestions to help callers correct input
 name_suggestions <- function(wk, player) {
-  name_col <- if ("player_name" %in% names(wk)) "player_name"
-              else if ("player_display_name" %in% names(wk)) "player_display_name"
-              else return(character())
+  if (!"name" %in% names(wk)) return(character())
   p_norm <- norm_name(player)
-  wk2 <- wk |> dplyr::mutate(player_norm = norm_name(.data[[name_col]]))
-  cand <- wk2 |>
-    dplyr::filter(
-      stringr::str_starts(player_norm, p_norm) |
-      stringr::str_detect(player_norm, stringr::fixed(p_norm))
-    ) |>
-    dplyr::distinct(.data[[name_col]]) |>
-    dplyr::arrange(.data[[name_col]]) |>
-    head(5)
-
-  # pull() with tidyselect fails on computed names; use [[ ]] safely
-  if (nrow(cand) == 0) character()
-  else unname(cand[[1]])
+  wk2 <- wk %>% mutate(name_norm = norm_name(name))
+  cand <- wk2 %>%
+    filter(str_starts(name_norm, p_norm) | str_detect(name_norm, fixed(p_norm))) %>%
+    distinct(name) %>%
+    arrange(name) %>%
+    head(5) %>%
+    pull(name)
+  unname(cand)
 }
 
 # -------- Endpoints --------
@@ -102,7 +94,7 @@ function() {
   )
 }
 
-#* Weekly rows for a player (robust name match)
+#* Weekly rows for a player (robust name match, prefers display name)
 #* @param player
 #* @param seasons Comma-separated years, e.g. 2025,2024
 #* @get /qb_weekly
@@ -114,7 +106,7 @@ function(player = "", seasons = "") {
     yrs <- as.integer(strsplit(seasons, ",", fixed = TRUE)[[1]])
     wk <- get_weekly(yrs)
 
-    qb <- find_player_rows(wk, player) |> dplyr::arrange(season, week)
+    qb <- find_player_rows(wk, player) %>% arrange(season, week)
     if (nrow(qb) == 0) {
       return(list(
         error = paste("no rows for", player),
@@ -142,7 +134,7 @@ function(player = "", seasons = "", window = 16, opponent = "") {
     yrs <- as.integer(strsplit(seasons, ",", fixed = TRUE)[[1]])
     wk <- get_weekly(yrs)
 
-    qb <- find_player_rows(wk, player) |> dplyr::arrange(season, week)
+    qb <- find_player_rows(wk, player) %>% arrange(season, week)
     if (nrow(qb) == 0) {
       return(list(
         error = paste("no rows for", player),
@@ -151,23 +143,20 @@ function(player = "", seasons = "", window = 16, opponent = "") {
     }
 
     # base lambda = mean of last N games; treat NA as 0
-    vec <- qb |> dplyr::pull(passing_tds)
+    vec <- qb %>% pull(passing_tds)
     vec <- tail(vec, window)
     vec[is.na(vec)] <- 0
     base <- mean(vec)
 
-    # optional opponent adjustment (needs opponent_team column in wk)
+    # optional opponent adjustment (needs opponent_team)
     if (opponent != "" && "opponent_team" %in% names(wk)) {
-      def_allow <- wk |>
-        dplyr::group_by(season, opponent_team) |>
-        dplyr::summarise(
-          opp_allow_tdpg = mean(passing_tds, na.rm = TRUE),
-          .groups = "drop"
-        ) |>
-        dplyr::rename(defteam = opponent_team)
+      def_allow <- wk %>%
+        group_by(season, opponent_team) %>%
+        summarise(opp_allow_tdpg = mean(passing_tds, na.rm = TRUE), .groups = "drop") %>%
+        rename(defteam = opponent_team)
 
       lg_avg <- mean(def_allow$opp_allow_tdpg, na.rm = TRUE)
-      row <- def_allow |> dplyr::filter(defteam == opponent)
+      row <- def_allow %>% filter(defteam == opponent)
 
       if (nrow(row) > 0 && is.finite(lg_avg) && lg_avg > 0) {
         factor <- as.numeric(row$opp_allow_tdpg[1]) / lg_avg
