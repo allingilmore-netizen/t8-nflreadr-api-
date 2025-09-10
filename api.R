@@ -1,14 +1,28 @@
-# api.R — plumber endpoints backed by nflreadr (defensive version)
+# api.R — plumber endpoints backed by nflreadr (schema-robust)
 library(plumber)
 library(nflreadr)
 library(dplyr)
 library(stringr)
 
-# helper: minimal weekly passing TD frame for seasons
+# Helper: load weekly player stats and normalize column names across versions
 get_weekly <- function(seasons) {
-  nflreadr::load_player_stats(seasons = seasons) %>%
-    select(season, week, player_id, player_name, recent_team, opponent, passing_tds) %>%
-    rename(team = recent_team)
+  df <- nflreadr::load_player_stats(seasons = seasons)
+
+  # Normalize team/opponent columns across package versions
+  nm <- names(df)
+  if (!"team" %in% nm && "recent_team" %in% nm) {
+    df <- dplyr::rename(df, team = recent_team)
+  }
+  if (!"opponent_team" %in% nm && "opponent" %in% nm) {
+    df <- dplyr::rename(df, opponent_team = opponent)
+  }
+
+  # Keep only what we need
+  df %>%
+    select(
+      any_of(c("season","week","player_id","player_name",
+               "team","opponent_team","passing_tds"))
+    )
 }
 
 # ------------- Endpoints ----------------
@@ -43,7 +57,7 @@ function(player = "", seasons = "") {
 #* @param player
 #* @param seasons Example: 2025,2024
 #* @param window:integer Default 16
-#* @param opponent Optional team abbr to adjust vs league avg allowed
+#* @param opponent Optional team abbr to adjust vs league avg allowed (e.g., BAL)
 #* @get /qb_lambda
 function(player = "", seasons = "", window = 16, opponent = "") {
   tryCatch({
@@ -61,17 +75,17 @@ function(player = "", seasons = "", window = 16, opponent = "") {
       return(list(error = paste("no rows for", player)))
     }
 
-    # base lambda = mean of last N games, NAs treated as 0
+    # base lambda = mean of last N games, NAs -> 0
     vec <- qb %>% tail(window) %>% pull(passing_tds)
     vec[is.na(vec)] <- 0
     base <- mean(vec)
 
-    # optional opponent adjustment
-    if (opponent != "") {
+    # optional opponent adjustment (uses normalized opponent_team)
+    if (opponent != "" && "opponent_team" %in% names(wk)) {
       def_allow <- wk %>%
-        group_by(season, opponent) %>%
+        group_by(season, opponent_team) %>%
         summarise(opp_allow_tdpg = mean(passing_tds, na.rm = TRUE), .groups = "drop") %>%
-        rename(defteam = opponent)
+        rename(defteam = opponent_team)
 
       lg_avg <- mean(def_allow$opp_allow_tdpg, na.rm = TRUE)
       row <- def_allow %>% filter(defteam == opponent)
