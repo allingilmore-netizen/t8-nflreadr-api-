@@ -51,7 +51,7 @@ function(player="", seasons="", window=16, opponent="") {
     arrange(season, week)
   if (nrow(qb) == 0) return(list(error=paste("no rows for", player)))
 
-  base <- qb %>% tail(window) %>% pull(passing_tds) %>% replace_na(0) %>% mean()
+base <- qb %>% tail(window) %>% pull(passing_tds) %>% dplyr::coalesce(0) %>% mean()
 
   if (opponent != "") {
     def_allow <- wk %>%
@@ -69,3 +69,4 @@ function(player="", seasons="", window=16, opponent="") {
   list(lambda = round(max(0.2, min(3.5, base)), 3),
        window = window, seasons = yrs, player = player, opponent = opponent)
 }
+
