@@ -1,16 +1,28 @@
 # api.R — Plumber endpoints backed by nflreadr (schema-robust + prefers display name)
+
 library(plumber)
 library(nflreadr)
 library(dplyr)
 library(stringr)
 library(jsonlite)
-library(rlang)   # <-- needed for rename(name = !!sym(name_col))
+library(rlang)   # for sym() in rename
 
 # -------- Helpers --------
 
+# Normalize names: lowercase, strip punctuation, drop common suffixes, squish spaces
+norm_name <- function(x) {
+  x |>
+    stringr::str_to_lower() |>
+    stringr::str_replace_all("[^a-z0-9 ]", " ") |>
+    stringr::str_replace_all("\\b(ii|iii|iv|jr|sr)\\b", "") |>
+    stringr::str_squish()
+}
+
+# A simpler key for fuzzy lookups
+norm_key <- function(s) stringr::str_squish(tolower(s))
+
 # Load weekly player stats for given seasons and normalize column names across versions
 get_weekly <- function(seasons) {
-  # offense keeps payload tighter than "all"
   df <- nflreadr::load_player_stats(seasons = seasons, stat_type = "offense")
   nm <- names(df)
 
@@ -23,33 +35,21 @@ get_weekly <- function(seasons) {
   }
 
   # Build a unified 'name' column, preferring full display name when available
-  # Common possibilities across versions: player_display_name, player_name, player
   name_col <- if ("player_display_name" %in% nm) "player_display_name"
-    else if ("player_name" %in% nm) "player_name"
-    else if ("player" %in% nm) "player"
-    else NA_character_
-
+         else if ("player_name" %in% nm) "player_name"
+         else if ("player" %in% nm) "player"
+         else NA_character_
   if (is.na(name_col)) stop("No player name column found in load_player_stats output.")
 
   df <- df %>% mutate(name = .data[[name_col]])
 
-  # Ensure passing_tds exists (offense should have it)
+  # Ensure passing_tds exists
   if (!"passing_tds" %in% names(df)) {
     stop("Column 'passing_tds' not found in load_player_stats output.")
   }
 
-  # Keep only what we need
   df %>%
     select(any_of(c("season","week","player_id","name","team","opponent_team","passing_tds")))
-}
-
-# Normalize names: lowercase, strip punctuation, drop common suffixes, squish spaces
-norm_name <- function(x) {
-  x |>
-    stringr::str_to_lower() |>
-    stringr::str_replace_all("[^a-z0-9 ]", " ") |>
-    stringr::str_replace_all("\\b(ii|iii|iv|jr|sr)\\b", "") |>
-    stringr::str_squish()
 }
 
 # Find rows for a player using robust matching on unified 'name'
@@ -67,7 +67,6 @@ find_player_rows <- function(wk, player) {
   cont <- wk2 %>% filter(str_detect(name_norm, fixed(p_norm)))
   if (nrow(cont) > 0) return(cont %>% select(-name_norm))
 
-  # nothing
   wk2[0, setdiff(names(wk2), "name_norm"), drop = FALSE]
 }
 
@@ -176,52 +175,85 @@ function(player = "", seasons = "", window = 16, opponent = "") {
 
 # ===== Extra endpoints for GPT helpers =====
 
-# Normalize simple key (lowercase + squish)
-.norm_key <- function(s) {
-  s <- tolower(s)
-  s <- stringr::str_squish(s)
-  s
-}
-
-#* Fuzzy search for player by name (case-insensitive)
+#* Fuzzy search for player by name (rosters-first; fallback to players)
 #* @param query string: partial or full name (e.g., "mahomes")
 #* @param limit integer: number of results (default 5)
+#* @param seasons string: optional comma-separated years (e.g., "2025,2024"); defaults to most recent
 #* @get /player_search
-function(query, limit = 5) {
+function(query, limit = 5, seasons = NULL) {
   limit <- as.integer(limit)
   if (is.na(limit) || limit < 1) limit <- 5
+  if (is.null(query) || nchar(query) == 0) {
+    return(plumber::response(status = 400, body = list(error = "query is required")))
+  }
 
-  df <- nflreadr::load_players()
-  name_col <- if ("display_name" %in% names(df)) "display_name" else "player_name"
-  cols <- intersect(c(name_col,"player_id","position","recent_team","team","full_name"), names(df))
-  df <- df[, cols, drop = FALSE]
-  df$`__key` <- .norm_key(df[[name_col]])
-  key <- .norm_key(query)
+  key <- norm_key(query)
 
-  # exact first
-  exact <- dplyr::filter(df, .data$`__key` == key)
-  res <- exact
-
-  # fuzzy if no exact
-  if (nrow(res) == 0) {
-    hits <- df[agrepl(key, df$`__key`, max.distance = 0.2, ignore.case = TRUE, useBytes = TRUE), , drop = FALSE]
-    if (nrow(hits) == 0) {
-      hits <- df[grepl(key, df$`__key`, fixed = TRUE), , drop = FALSE]
+  # determine seasons (keeps dataset small)
+  yrs <- tryCatch({
+    if (!is.null(seasons) && nchar(seasons) > 0) {
+      y <- as.integer(strsplit(seasons, ",", fixed = TRUE)[[1]])
+      y[!is.na(y)]
+    } else {
+      nflreadr::most_recent_season()
     }
-    res <- hits
+  }, error = function(e) nflreadr::most_recent_season())
+
+  search_df <- function(df, namecol) {
+    df$`__key` <- norm_key(df[[namecol]])
+
+    # exact
+    res <- df[df$`__key` == key, , drop = FALSE]
+
+    # fuzzy if empty
+    if (nrow(res) == 0) {
+      hits <- df[agrepl(key, df$`__key`, max.distance = 0.2, ignore.case = TRUE, useBytes = TRUE), , drop = FALSE]
+      if (nrow(hits) == 0) {
+        hits <- df[grepl(key, df$`__key`, fixed = TRUE), , drop = FALSE]
+      }
+      res <- hits
+    }
+
+    if (nrow(res) == 0) return(NULL)
+
+    out <- res
+    out$name <- out[[namecol]]
+    if (!"team" %in% names(out)) out$team <- NA_character_
+    if (!"position" %in% names(out)) out$position <- NA_character_
+    out[, c("player_id","name","team","position"), drop = FALSE]
   }
 
-  if (nrow(res) == 0) {
-    return(plumber::response(status = 404, body = list(error = "Player not found")))
+  # 1) Try rosters first (fast, small)
+  try_rosters <- tryCatch({
+    ro <- nflreadr::load_rosters(yrs)
+    nm_name <- if ("full_name" %in% names(ro)) "full_name" else if ("player_name" %in% names(ro)) "player_name" else NA_character_
+    if (is.na(nm_name)) stop("No name column in rosters")
+    keep <- intersect(c("player_id", nm_name, "team", "position"), names(ro))
+    ro[, keep, drop = FALSE]
+  }, error = function(e) NULL)
+
+  if (!is.null(try_rosters)) {
+    out <- search_df(try_rosters, if ("full_name" %in% names(try_rosters)) "full_name" else "player_name")
+    if (!is.null(out)) return(head(out, limit))
   }
 
-  res <- res |>
-    dplyr::rename(name = !!rlang::sym(name_col)) |>   # <-- fixed: handle string column name
-    dplyr::mutate(team = dplyr::coalesce(.data$recent_team, .data$team)) |>
-    dplyr::select(dplyr::any_of(c("player_id","name","team","position"))) |>
-    head(limit)
+  # 2) Fallback: players table (bigger; guard with tryCatch)
+  try_players <- tryCatch({
+    df <- nflreadr::load_players()
+    name_col <- if ("display_name" %in% names(df)) "display_name" else if ("player_name" %in% names(df)) "player_name" else stop("No name column in players")
+    keep <- intersect(c(name_col, "player_id", "position", "recent_team", "team", "full_name"), names(df))
+    df <- df[, keep, drop = FALSE]
+    if (!"team" %in% names(df)) df$team <- df$recent_team
+    attr(df, "name_col") <- name_col
+    df
+  }, error = function(e) NULL)
 
-  jsonlite::toJSON(res, dataframe = "rows", auto_unbox = TRUE)
+  if (!is.null(try_players)) {
+    out <- search_df(try_players, attr(try_players, "name_col"))
+    if (!is.null(out)) return(head(out, limit))
+  }
+
+  plumber::response(status = 404, body = list(error = "Player not found"))
 }
 
 #* Canonical NFL team abbreviations
@@ -234,7 +266,8 @@ function() {
     dplyr::select(dplyr::any_of(c(abbr, name))) |>
     dplyr::distinct() |>
     dplyr::rename(team = !!rlang::sym(abbr), full_name = !!rlang::sym(name))
-  jsonlite::toJSON(out, dataframe = "rows", auto_unbox = TRUE)
+  # return plain R object (Plumber JSON-encodes once)
+  out
 }
 
 #* Last-N games metrics (passing TDs mean, attempts, yds; blend last N and season)
@@ -256,9 +289,9 @@ function(player, seasons, window = 5) {
   }
   nmcol <- name_cols[1]
 
-  weekly$`.__key` <- .norm_key(weekly[[nmcol]])
-  target <- .norm_key(player)
-  sub <- weekly[weekly$`.__key` == target, , drop = FALSE]
+  weekly$`__key` <- norm_key(weekly[[nmcol]])
+  target <- norm_key(player)
+  sub <- weekly[weekly$`__key` == target, , drop = FALSE]
   if ("position" %in% names(sub)) {
     sub <- sub[sub$position == "QB", , drop = FALSE]
   }
@@ -267,8 +300,7 @@ function(player, seasons, window = 5) {
   }
 
   # most recent first
-  sort_cols <- intersect(c("season","week"), names(sub))
-  if (length(sort_cols)) {
+  if (all(c("season","week") %in% names(sub))) {
     sub <- sub[order(-sub$season, -sub$week), , drop = FALSE]
   }
   w <- as.integer(window); if (is.na(w) || w < 1) w <- 5
@@ -281,17 +313,16 @@ function(player, seasons, window = 5) {
   mean_or_null <- function(v) if (is.null(v)) NULL else suppressWarnings(mean(subN[[v]], na.rm = TRUE))
   sd_or_null   <- function(v) if (is.null(v)) NULL else suppressWarnings(sd(subN[[v]], na.rm = TRUE))
 
-  out <- list(
+  list(
     games = nrow(subN),
     td_mean = mean_or_null(td_col),
     td_std  = sd_or_null(td_col),
     attempts_mean = mean_or_null(att_col),
     yards_mean    = mean_or_null(yds_col)
   )
-  jsonlite::toJSON(out, auto_unbox = TRUE, na = "null")
 }
 
-# (Startup is handled by your Docker/entrypoint; keep it as-is.)
+# (Startup handled by your Docker/entrypoint.)
 # pr <- plumb("api.R")
 # pr$setDocs("swagger")
 # pr$run(host = "0.0.0.0", port = as.integer(Sys.getenv("PORT", 10000)))
